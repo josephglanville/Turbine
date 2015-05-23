@@ -1,15 +1,13 @@
-
-
-use sync::Arc;
+use std::sync::atomic::{AtomicUsize,Ordering};
+use std::sync::Arc;
 use waitstrategy::{WaitStrategy};
-use paddedatomics::Padded64;
 use ringbuffer::{RingBuffer, Slot};
 
 /// EventProcessors provide functionality to process and consume data from the ring buffer
 pub struct EventProcessor<T> {
-    graph: Arc<Vec<Vec<uint>>>,
-    cursors: Arc<Vec<Padded64>>,
-    token: uint,
+    graph: Arc<Vec<Vec<usize>>>,
+    cursors: Arc<Vec<AtomicUsize>>,
+    token: usize,
     ring: Arc<RingBuffer<T>>
 }
 
@@ -21,9 +19,9 @@ impl<T: Slot> EventProcessor<T> {
     /// This accepts several important parameters and is for internal use only.
     /// - ring: an instance of the ring buffer
     /// - graph: a dependency graph, showing how all the EPs relate to eachother.
-    /// - cursors: a vector of Padded64 atomics which act as cursors into the ring buffer
+    /// - cursors: a vector of AtomicUsize atomics which act as cursors into the ring buffer
     /// - token: the index in the graph which represents this EP
-    pub fn new(ring: Arc<RingBuffer<T>>, graph: Arc<Vec<Vec<uint>>>, cursors: Arc<Vec<Padded64>>, token: uint) -> EventProcessor<T> {
+    pub fn new(ring: Arc<RingBuffer<T>>, graph: Arc<Vec<Vec<usize>>>, cursors: Arc<Vec<AtomicUsize>>, token: usize) -> EventProcessor<T> {
         EventProcessor::<T> {
             graph: graph,
             cursors: cursors,
@@ -57,13 +55,13 @@ impl<T: Slot> EventProcessor<T> {
     ///     });
     ///});
     ///```
-    pub fn start<W: WaitStrategy>(&self, f: |data: &[T]| -> Result<(),()>) {
+    pub fn start<W: WaitStrategy, F>(&self, f: F) where F: FnMut(&[T]) -> Result<(),()> {
         let capacity = self.ring.get_capacity();
 
         let wait_strategy: W = WaitStrategy::new(capacity);
 
         let ref dep_eps = self.graph.as_slice()[self.token];
-        let mut deps: Vec<&Padded64> = Vec::with_capacity(dep_eps.len());
+        let mut deps: Vec<&AtomicUsize> = Vec::with_capacity(dep_eps.len());
         for ep in dep_eps.iter() {
             deps.push(&(*self.cursors).as_slice()[*ep]);
         }
@@ -72,7 +70,7 @@ impl<T: Slot> EventProcessor<T> {
         let ref cursor = &(*self.cursors).as_slice()[self.token + 1];
 
         let mask: u64 = capacity as u64 - 1;
-        let mut internal_cursor = cursor.load();
+        let mut internal_cursor = cursor.load(Ordering::SeqCst) as u64;
         let mut rollover = (false, 0);
 
         loop {
@@ -81,8 +79,8 @@ impl<T: Slot> EventProcessor<T> {
             let available = wait_strategy.wait_for(internal_cursor, &deps);
             debug!("							Available: {}", available);
 
-            let from = (internal_cursor & mask) as uint;
-            let mut to = (available & mask) as uint;
+            let from = (internal_cursor & mask) as usize;
+            let mut to = (available & mask) as usize;
 
             debug!("              from: {}, to: {} -- {}", from, to, (to < from));
             if to < from {
@@ -110,17 +108,17 @@ impl<T: Slot> EventProcessor<T> {
                 f(data)
             };
 
-            if rollover.val0() == true {
+            if rollover.0 == true {
                 debug!("ROlLOVER GET");
                 status = unsafe {
-                    let data: &[T] = self.ring.get(0, rollover.val1());
+                    let data: &[T] = self.ring.get(0, rollover.1);
                     f(data)
                 };
                 rollover = (false,0);
             }
 
             internal_cursor = available;
-            cursor.store(internal_cursor);
+            cursor.store(internal_cursor as usize, Ordering::SeqCst);
             debug!("					Finished processing event.  Cursor @ {} ({})", available, available & mask);
 
             match status {
